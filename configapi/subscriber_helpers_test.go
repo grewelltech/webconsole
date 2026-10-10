@@ -368,17 +368,6 @@ func Test_handleSubscriberDelete(t *testing.T) {
 	}
 }
 
-func Test_handleSubscriberGet(t *testing.T) {
-	origAuthDBClient := dbadapter.AuthDBClient
-	defer func() { dbadapter.AuthDBClient = origAuthDBClient }()
-	subscriber := authenticationSubscription()
-	dbadapter.AuthDBClient = &AuthDBMockDBClient{subscribers: []string{testSubscriberImsi}}
-	subscriberResult := subscriberAuthenticationDataGet(testSubscriberImsi)
-	if !reflect.DeepEqual(subscriber, subscriberResult) {
-		t.Errorf("expected subscriber %v, got %v", &subscriber, subscriberResult)
-	}
-}
-
 // This write path fetches a device group straight from storage rather than through
 // deviceGroupPostHelper, so it must relabel a rate unit left over from before that helper stored
 // it as bps -- otherwise it persists the stale unit rather than correcting it.

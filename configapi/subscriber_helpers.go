@@ -17,21 +17,6 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
-func subscriberAuthenticationDataGet(imsi string) (authSubData *models.AuthenticationSubscription) {
-	filter := bson.M{ueIdKey: imsi}
-	authSubDataInterface, err := dbadapter.AuthDBClient.RestfulAPIGetOne(authSubsDataColl, filter)
-	if err != nil {
-		logger.DbLog.Errorln(err)
-		return
-	}
-	err = json.Unmarshal(configmodels.MapToByte(authSubDataInterface), &authSubData)
-	if err != nil {
-		logger.DbLog.Errorf("could not unmarshall subscriber %+v", authSubDataInterface)
-		return
-	}
-	return authSubData
-}
-
 func subscriberAuthenticationDataCreate(imsi string, authSubData *models.AuthenticationSubscription) error {
 	filter := bson.M{ueIdKey: imsi}
 	logger.WebUILog.Infof("%+v", authSubData)

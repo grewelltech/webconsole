@@ -99,10 +99,29 @@ type indexEnsurer interface {
 	EnsureIndex(ctx context.Context, collName string, spec mongoapi.IndexSpec) error
 }
 
+// UpsertOperation is one write of a bulk upsert: the first document matching
+// Filter has Data set on it, and a document is inserted from Filter and Data
+// when none matches. It is the bulk form of RestfulAPIPutOne.
+type UpsertOperation struct {
+	Filter bson.M
+	Data   map[string]any
+}
+
+// bulkUpserter is kept out of DBInterface for the same reason as indexEnsurer:
+// only the subscriber sync calls it, and widening DBInterface would make every
+// test double implement it. *MongoDBClient satisfies it through the embedded
+// mongoapi.MongoClient's collection handle.
+type bulkUpserter interface {
+	BulkUpsert(ctx context.Context, collName string, ops []UpsertOperation) error
+}
+
 // indexEnsureAttemptTimeout bounds one EnsureIndex call, which builds the index
 // and then reads the collection's indexes back to confirm it. Without it a hung
 // call would spend the whole retry budget on one attempt instead of being retried.
 const indexEnsureAttemptTimeout = 30 * time.Second
+
+// opSet is the update operator that replaces the given fields and leaves the rest.
+const opSet = "$set"
 
 var (
 	CommonDBClient DBInterface
@@ -333,6 +352,29 @@ func ensureIndexWithRetry(client indexEnsurer, collName string, spec mongoapi.In
 	}
 }
 
+// BulkUpsert applies ops to collName through client in one unordered bulk
+// write, or one upsert at a time when client cannot bulk write, so a test
+// double that only records RestfulAPIPutOne still sees every document. The
+// bulk write is unordered so that one failed document does not stop the rest:
+// the caller re-reads before it writes, so a retry carries only what is left.
+func BulkUpsert(ctx context.Context, client DBInterface, collName string, ops []UpsertOperation) error {
+	if client == nil {
+		return fmt.Errorf("mongoDB client has not been initialized")
+	}
+	if len(ops) == 0 {
+		return nil
+	}
+	if upserter, ok := client.(bulkUpserter); ok {
+		return upserter.BulkUpsert(ctx, collName, ops)
+	}
+	for _, op := range ops {
+		if _, err := client.RestfulAPIPutOne(collName, op.Filter, op.Data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func isRetryableIndexError(err error) bool {
 	if err == nil {
 		return false
@@ -483,6 +525,18 @@ func (db *MongoDBClient) CreateIndex(collName string, keyField string) (bool, er
 	return db.MongoClient.CreateIndex(collName, keyField)
 }
 
+// BulkUpsert sends ops to collName as one unordered bulk write of upserts.
+func (db *MongoDBClient) BulkUpsert(ctx context.Context, collName string, ops []UpsertOperation) error {
+	models := make([]mongo.WriteModel, 0, len(ops))
+	for _, op := range ops {
+		models = append(models, mongo.NewUpdateOneModel().SetFilter(op.Filter).SetUpdate(bson.M{opSet: op.Data}).SetUpsert(true))
+	}
+	if _, err := db.MongoClient.GetCollection(collName).BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false)); err != nil {
+		return fmt.Errorf("BulkUpsert on %s err: %w", collName, err)
+	}
+	return nil
+}
+
 func (db *MongoDBClient) StartSession() (DBSession, error) {
 	session, err := db.MongoClient.StartSession()
 	if err != nil || session == nil {
@@ -503,7 +557,7 @@ func (db *MongoDBClient) RestfulAPIPostOnDB(ctx context.Context, dbName string, 
 		return false, fmt.Errorf("RestfulAPIPostOnDB FindOne err: %w", err)
 	}
 	if existing != nil {
-		if _, err := collection.UpdateOne(ctx, filter, bson.M{"$set": postData}); err != nil {
+		if _, err := collection.UpdateOne(ctx, filter, bson.M{opSet: postData}); err != nil {
 			return false, fmt.Errorf("RestfulAPIPostOnDB UpdateOne err: %w", err)
 		}
 		return true, nil
@@ -522,7 +576,7 @@ func (db *MongoDBClient) RestfulAPIPutOneOnDB(ctx context.Context, dbName string
 		return false, fmt.Errorf("RestfulAPIPutOneOnDB FindOne err: %w", err)
 	}
 	if existing != nil {
-		if _, err := collection.UpdateOne(ctx, filter, bson.M{"$set": putData}); err != nil {
+		if _, err := collection.UpdateOne(ctx, filter, bson.M{opSet: putData}); err != nil {
 			return false, fmt.Errorf("RestfulAPIPutOneOnDB UpdateOne err: %w", err)
 		}
 		return true, nil

@@ -12,12 +12,10 @@ import (
 	"net/http"
 	"os/exec"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/omec-project/openapi/v2"
 	"github.com/omec-project/openapi/v2/models"
 	"github.com/omec-project/webconsole/backend/factory"
 	"github.com/omec-project/webconsole/backend/logger"
@@ -640,30 +638,12 @@ func processDeviceGroup(devGroupConfig *configmodels.DeviceGroups, snssai *model
 	}
 	// Calculate aggregate QoS once for the entire group
 	aggregatedQoS := aggregateQoS(allQosProfiles)
-	for i, imsi := range devGroupConfig.Imsis {
-		if subscriberAuthenticationDataGet("imsi-"+imsi) != nil {
-			// Process each IP domain for this IMSI
-			var gpsi string
-			if devGroupConfig.Msisdns != nil && i < len(devGroupConfig.Msisdns) {
-				gpsi = devGroupConfig.Msisdns[i]
-			}
-			// Call update functions once after processing all DNNs
-			logger.ConfigLog.Infoln("Processing IMSI:", imsi, "with GPSI:", gpsi)
-			err := updatePolicyAndProvisionedData(
-				imsi,
-				gpsi,
-				snssai,
-				dnnMap,
-				mcc,
-				mnc,
-				aggregatedQoS,
-			)
-			if err != nil {
-				logger.DbLog.Errorf("updatePolicyAndProvisionedData failed for IMSI %s: %+v", imsi, err)
-				return http.StatusInternalServerError, err
-			}
-		}
+	report, err := syncProvisionedSubscribers(devGroupConfig.Imsis, devGroupConfig.Msisdns, snssai, dnnMap, mcc, mnc, aggregatedQoS)
+	if err != nil {
+		logger.DbLog.Errorf("syncing the subscribers of device group %s failed: %+v", devGroupConfig.DeviceGroupName, err)
+		return http.StatusInternalServerError, err
 	}
+	logger.WebUILog.Infof("synced the subscribers of device group %s: %s", devGroupConfig.DeviceGroupName, report)
 	return http.StatusOK, nil
 }
 
@@ -687,126 +667,6 @@ func cleanupDeviceGroups(slice, prevSlice configmodels.Slice) error {
 			}
 		}
 	}
-	return nil
-}
-
-func updatePolicyAndProvisionedData(imsi string, gpsi string, snssai *models.Snssai, dnnMap map[string][]configmodels.DeviceGroupsIpDomainExpandedUeDnnQos, mcc string, mnc string, aggregatedQoS configmodels.DeviceGroupsIpDomainExpandedUeDnnQos) error {
-	err := updateAmPolicyData(imsi)
-	if err != nil {
-		return fmt.Errorf("updateAmPolicyData failed: %w", err)
-	}
-	err = updateSmPolicyData(snssai, dnnMap, imsi)
-	if err != nil {
-		return fmt.Errorf("updateSmPolicyData failed: %w", err)
-	}
-	err = updateAmProvisionedData(gpsi, snssai, aggregatedQoS, mcc, mnc, imsi)
-	if err != nil {
-		return fmt.Errorf("updateAmProvisionedData failed: %w", err)
-	}
-	err = updateSmProvisionedData(snssai, dnnMap, mcc, mnc, imsi)
-	if err != nil {
-		return fmt.Errorf("updateSmProvisionedData failed: %w", err)
-	}
-	err = updateSmfSelectionProvisionedData(snssai, mcc, mnc, dnnMap, imsi)
-	if err != nil {
-		return fmt.Errorf("updateSmfSelectionProvisionedData failed: %w", err)
-	}
-	return nil
-}
-
-func updateAmPolicyData(imsi string) error {
-	var amPolicy models.AmPolicyData
-	amPolicy.SubscCats = append(amPolicy.SubscCats, subscCatAether)
-	amPolicyDatBsonA := configmodels.ToBsonM(amPolicy)
-	amPolicyDatBsonA[ueIdKey] = "imsi-" + imsi
-	filter := bson.M{ueIdKey: "imsi-" + imsi}
-	_, err := dbadapter.CommonDBClient.RestfulAPIPost(amPolicyDataColl, filter, amPolicyDatBsonA)
-	if err != nil {
-		logger.DbLog.Errorf("failed to update AM Policy Data for IMSI %s: %+v", imsi, err)
-		return err
-	}
-	logger.DbLog.Debugf("succeeded to update AM Policy Data for IMSI %s", imsi)
-	return nil
-}
-
-func updateSmPolicyData(snssai *models.Snssai, dnnMap map[string][]configmodels.DeviceGroupsIpDomainExpandedUeDnnQos, imsi string) error {
-	var smPolicyData models.SmPolicyData
-	var smPolicySnssaiData models.SmPolicySnssaiData
-	// Iterate over all DNNs in the map
-	dnnData := &map[string]models.SmPolicyDnnData{}
-
-	for dnn := range dnnMap { // Extract each DNN from the map
-		(*dnnData)[dnn] = models.SmPolicyDnnData{
-			Dnn: dnn,
-		}
-	}
-	// smpolicydata
-	smPolicySnssaiData.Snssai = *snssai
-	smPolicySnssaiData.SmPolicyDnnData = dnnData
-	smPolicyData.SmPolicySnssaiData = make(map[string]models.SmPolicySnssaiData)
-	smPolicyData.SmPolicySnssaiData[SnssaiModelsToHex(*snssai)] = smPolicySnssaiData
-	smPolicyDatBsonA := configmodels.ToBsonM(smPolicyData)
-	smPolicyDatBsonA[ueIdKey] = "imsi-" + imsi
-	filter := bson.M{ueIdKey: "imsi-" + imsi}
-	_, err := dbadapter.CommonDBClient.RestfulAPIPost(smPolicyDataColl, filter, smPolicyDatBsonA)
-	if err != nil {
-		logger.DbLog.Errorf("failed to update SM Policy Data for IMSI %s: %+v", imsi, err)
-		return err
-	}
-	logger.DbLog.Debugf("succeeded to update SM Policy Data for IMSI %s", imsi)
-	return nil
-}
-
-func updateAmProvisionedData(gpsi string, snssai *models.Snssai, aggregatedQoS configmodels.DeviceGroupsIpDomainExpandedUeDnnQos, mcc, mnc, imsi string) error {
-	var gpsiSlice []string // Initialize a slice to hold the GPSI.
-	if gpsi != "" {        // Only add if gpsi is not empty
-		gpsiSlice = []string{gpsi}
-	}
-	amData := models.AccessAndMobilitySubscriptionData{
-		Gpsis: gpsiSlice,
-		Nssai: *models.NewNullableNssai(&models.Nssai{
-			DefaultSingleNssais: []models.Snssai{*snssai},
-			SingleNssais:        []models.Snssai{*snssai},
-		}),
-		SubscribedUeAmbr: models.NewAmbr(ConvertToString(uint64(aggregatedQoS.DnnMbrUplink)), ConvertToString(uint64(aggregatedQoS.DnnMbrDownlink))),
-	}
-	amDataBsonA := configmodels.ToBsonM(amData)
-	amDataBsonA[ueIdKey] = "imsi-" + imsi
-	amDataBsonA[servingPlmnIdKey] = mcc + mnc
-	filter := bson.M{
-		ueIdKey: "imsi-" + imsi,
-		"$or": []bson.M{
-			{servingPlmnIdKey: mcc + mnc},
-			{servingPlmnIdKey: bson.M{"$exists": false}},
-		},
-	}
-	_, err := dbadapter.CommonDBClient.RestfulAPIPost(amDataColl, filter, amDataBsonA)
-	if err != nil {
-		logger.DbLog.Errorf("failed to update AM provisioned Data for IMSI %s: %+v", imsi, err)
-		return err
-	}
-	logger.DbLog.Debugf("succeeded to update AM provisioned Data for IMSI %s", imsi)
-	return nil
-}
-
-func updateSmProvisionedData(snssai *models.Snssai, dnnMap map[string][]configmodels.DeviceGroupsIpDomainExpandedUeDnnQos, mcc, mnc, imsi string) error {
-	filter := bson.M{
-		ueIdKey:          "imsi-" + imsi,
-		servingPlmnIdKey: mcc + mnc,
-	}
-
-	smDataBsonA, err := buildSmProvisionedDataDocument(snssai, dnnMap, mcc, mnc, imsi)
-	if err != nil {
-		return err
-	}
-
-	logger.DbLog.Infof("Data to be sent to database - SmProvisionedData: %+v", smDataBsonA)
-	_, errPut := dbadapter.CommonDBClient.RestfulAPIPutOne(smDataColl, filter, smDataBsonA)
-	if errPut != nil {
-		logger.DbLog.Errorf("failed to update SM provisioned Data for IMSI %s: %+v", imsi, errPut)
-		return errPut
-	}
-	logger.DbLog.Debugf("updated SM provisioned Data for IMSI %s", imsi)
 	return nil
 }
 
@@ -858,55 +718,6 @@ func buildSmProvisionedDataDocument(snssai *models.Snssai, dnnMap map[string][]c
 		"singlenssai":       singleNssai,
 		"dnnconfigurations": dnnConfigurations,
 	}, nil
-}
-
-func updateSmfSelectionProvisionedData(snssai *models.Snssai, mcc, mnc string, dnnMap map[string][]configmodels.DeviceGroupsIpDomainExpandedUeDnnQos, imsi string) error {
-	smfSelData := models.SmfSelectionSubscriptionData{
-		SubscribedSnssaiInfos: &map[string]models.SnssaiInfo{},
-	}
-
-	snssaiInfo := models.SnssaiInfo{
-		DnnInfos: []models.DnnInfo{},
-	}
-	// Collect DNN keys
-	dnns := make([]string, 0, len(dnnMap))
-	for dnn := range dnnMap {
-		dnns = append(dnns, dnn)
-	}
-
-	// Sort for deterministic ordering
-	sort.Strings(dnns)
-
-	// Append in sorted order
-	for _, dnn := range dnns {
-		snssaiInfo.DnnInfos = append(snssaiInfo.DnnInfos, models.DnnInfo{
-			Dnn: models.AccessAndMobilitySubscriptionDataSubscribedDnnListInner{
-				String: openapi.PtrString(dnn),
-			},
-		})
-	}
-	(*smfSelData.SubscribedSnssaiInfos)[SnssaiModelsToHex(*snssai)] = snssaiInfo
-	smfSelecDataBsonA := configmodels.ToBsonM(smfSelData)
-	smfSelecDataBsonA[ueIdKey] = "imsi-" + imsi
-	smfSelecDataBsonA[servingPlmnIdKey] = mcc + mnc
-
-	// Define the filter for the database operation
-	filter := bson.M{
-		ueIdKey:          "imsi-" + imsi,
-		servingPlmnIdKey: mcc + mnc,
-	}
-
-	// Log the data to be sent to the database
-	logger.DbLog.Infof("Data to be sent to database - smf selection: %+v", smfSelecDataBsonA)
-
-	// Perform the database post operation
-	_, errPost := dbadapter.CommonDBClient.RestfulAPIPost(smfSelDataColl, filter, smfSelecDataBsonA)
-	if errPost != nil {
-		logger.DbLog.Errorf("failed to update SMF selection provisioned data for IMSI %s: %+v", imsi, errPost)
-		return errPost
-	}
-	logger.DbLog.Debugf("updated SMF selection provisioned data for IMSI %s", imsi)
-	return nil
 }
 
 func SnssaiModelsToHex(snssai models.Snssai) string {

@@ -305,28 +305,12 @@ func syncDeviceGroupSubscriber(devGroup *configmodels.DeviceGroups, prevDevGroup
 	}
 
 	aggregatedQoS := aggregateQoS(allQosProfiles)
-	for i, imsi := range devGroup.Imsis {
-		/* update all current IMSIs */
-		if subscriberAuthenticationDataGet("imsi-"+imsi) != nil {
-			var gpsi string
-			if devGroup.Msisdns != nil && i < len(devGroup.Msisdns) {
-				gpsi = devGroup.Msisdns[i]
-			}
-			err = updatePolicyAndProvisionedData(
-				imsi,
-				gpsi,
-				snssai,
-				dnnMap,
-				mcc,
-				mnc,
-				aggregatedQoS,
-			)
-			if err != nil {
-				logger.DbLog.Errorf("updatePolicyAndProvisionedData failed for IMSI %s: %+v", imsi, err)
-				errorOccured = true
-			}
-		}
+	report, err := syncProvisionedSubscribers(devGroup.Imsis, devGroup.Msisdns, snssai, dnnMap, mcc, mnc, aggregatedQoS)
+	if err != nil {
+		logger.DbLog.Errorf("syncing the subscribers of device group %s failed: %+v", devGroup.DeviceGroupName, err)
+		errorOccured = true
 	}
+	logger.WebUILog.Infof("synced the subscribers of device group %s with slice %s: %s", devGroup.DeviceGroupName, slice.SliceName, report)
 	// delete IMSI's that are removed
 	dimsis := getDeletedImsisList(devGroup, prevDevGroup)
 	for _, imsi := range dimsis {
