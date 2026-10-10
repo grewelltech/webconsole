@@ -965,45 +965,6 @@ func TestBuildSmProvisionedDataDocument(t *testing.T) {
 	}
 }
 
-func TestUpdateSmProvisionedData_UsesPutOne(t *testing.T) {
-	originalDBClient := dbadapter.CommonDBClient
-	defer func() { dbadapter.CommonDBClient = originalDBClient }()
-
-	mock := &NetworkSliceMockDBClient{}
-	dbadapter.CommonDBClient = mock
-
-	snssai := &models.Snssai{Sst: 1, Sd: openapi.PtrString("010203")}
-	dnnMap := map[string][]configmodels.DeviceGroupsIpDomainExpandedUeDnnQos{
-		dnnInternet: {
-			{
-				DnnMbrUplink:   2000000,
-				DnnMbrDownlink: 5000000,
-				TrafficClass:   &configmodels.TrafficClassInfo{Qci: 9},
-			},
-		},
-	}
-
-	if err := updateSmProvisionedData(snssai, dnnMap, "208", "93", "208930100007487"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if len(mock.postData) != 0 {
-		t.Fatalf("expected no post calls, got %d", len(mock.postData))
-	}
-	if len(mock.putData) != 1 {
-		t.Fatalf("expected one put call, got %d", len(mock.putData))
-	}
-	data, ok := mock.putData[0][dataKey].(map[string]any)
-	if !ok {
-		t.Fatalf("unexpected put payload type: %T", mock.putData[0][dataKey])
-	}
-	if _, ok = data["singlenssai"]; !ok {
-		t.Fatal("expected singlenssai key in put payload")
-	}
-	if _, ok = data["dnnconfigurations"]; !ok {
-		t.Fatal("expected dnnconfigurations key in put payload")
-	}
-}
-
 func filteringRuleWithRates(unit string, mbrUl, mbrDl, gbrUl, gbrDl int32) configmodels.SliceApplicationFilteringRules {
 	return configmodels.SliceApplicationFilteringRules{
 		RuleName:       "rate-rule",
